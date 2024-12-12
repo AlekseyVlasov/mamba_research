@@ -1,0 +1,29 @@
+gpu_number: 2
+seed: 1234
+save_model: True
+
+wandb:
+  project: "mamba-research"
+  group: "induction_heads"
+  name: "256 sequence length"
+
+model:
+  name: "mamba"
+  save_name: "mamba_256"
+  d_state: 16
+  d_model: 32
+  n_layer: 2
+
+training:
+  batch_size: 32
+  epochs: 15
+  learning_rate: 0.001
+  warmup: 3
+
+dataset:
+  name: "induction_heads"
+  train_examples: 32000
+  test_examples: 32000
+  vocab_size: 16
+  input_seq_len: 256
+  test_batch_size: 32

@@ -1,0 +1,28 @@
+gpu_number: 0
+seed: 1234
+save_model: True
+
+wandb:
+  project: "mamba-research"
+  group: "induction_heads"
+  name: "embeddings 1 1000"
+
+model:
+  name: "embeddings"
+  base_model: "mamba_256"
+  period: 1000
+  tokens_num: 1
+
+training:
+  batch_size: 4
+  epochs: 10
+  learning_rate: 0.01
+  warmup: 3
+
+dataset:
+  name: "induction_heads"
+  train_examples: 16000
+  test_examples: 4000
+  vocab_size: 16
+  input_seq_len: 32768
+  test_batch_size: 1
