@@ -225,7 +225,9 @@ class MambaLMHeadModelWithEmbeddings(nn.Module, GenerationMixin):
         initializer_cfg=None,
         device=None,
         dtype=None,
+        num_labels=None,
     ) -> None:
+        self.num_labels = num_labels
         self.config = config
         d_model = config.d_model
         n_layer = config.n_layer
@@ -259,6 +261,9 @@ class MambaLMHeadModelWithEmbeddings(nn.Module, GenerationMixin):
         )
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
 
+        if self.num_labels is not None:
+            self.classification_head = nn.Linear(d_model, num_labels, **factory_kwargs)
+
         # Initialize weights and apply final processing
         self.apply(
             partial(
@@ -284,16 +289,28 @@ class MambaLMHeadModelWithEmbeddings(nn.Module, GenerationMixin):
         hidden_states = self.backbone(input_ids, inference_params=inference_params, is_embeds=is_embeds, **mixer_kwargs)
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
-        lm_logits = self.lm_head(hidden_states)
+
+        if self.classification_head is not None:
+            lm_logits = self.classification_head(hidden_states)
+        else:
+            lm_logits = self.lm_head(hidden_states)
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
         return CausalLMOutput(logits=lm_logits)
 
+    def freeze_layers(self):
+        for param in self.parameters():
+            param.requires_grad = False
+        
+        if self.classification_head is not None:
+            for param in self.classification_head.parameters():
+                param.requires_grad = True
+
     @classmethod
-    def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, **kwargs):
+    def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, num_labels=None, **kwargs):
         config_data = load_config_hf(pretrained_model_name)
         config = MambaConfig(**config_data)
-        model = cls(config, device=device, dtype=dtype, **kwargs)
-        model.load_state_dict(load_state_dict_hf(pretrained_model_name, device=device, dtype=dtype))
+        model = cls(config, device=device, dtype=dtype, num_labels=num_labels, **kwargs)
+        model.load_state_dict(load_state_dict_hf(pretrained_model_name, device=device, dtype=dtype), strict=False)
         return model
 
     def save_pretrained(self, save_directory):
