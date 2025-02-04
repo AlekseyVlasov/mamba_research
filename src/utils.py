@@ -1,3 +1,7 @@
+import torch
+import numpy as np
+
+
 def print_model_size(model):
     total_params = sum(p.numel() for p in model.parameters())
     
@@ -8,3 +12,7 @@ def print_model_size(model):
     print(f"Model parameters number: {total_params}")
     print(f"Model size: {total_size_in_mb:.2f} MB")
     print(f"Model size: {total_size_in_gb:.2f} GB")
+
+def fix_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
