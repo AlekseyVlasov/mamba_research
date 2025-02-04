@@ -1,0 +1,19 @@
+gpu_number: 1
+seed: 1234
+save_model: False
+
+wandb:
+  project: "mamba-research"
+  group: "yelp_reviews"
+  name: "fine-tune"
+
+model:
+  name: "state-spaces/mamba-130m"
+
+training_type: "fine-tune"
+
+training:
+  batch_size: 16
+  epochs: 3
+  learning_rate: 0.0001
+  warmup_percent: 0.05
