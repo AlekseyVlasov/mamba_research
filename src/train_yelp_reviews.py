@@ -365,6 +365,8 @@ if __name__ == "__main__":
     model_config = args["model"]
     train_config = args["training"]
     training_type = args["training_type"]
+    if training_type == "fine-tune":
+        freeze = args["freeze"]
 
     # start wandb logging
     if wandb_config is not None:
@@ -397,7 +399,7 @@ if __name__ == "__main__":
     train_dataset = tokenized_datasets["train"]
     test_dataset = tokenized_datasets["test"]
 
-    train_dataloader = DataLoader(train_dataset, batch_size=train_config['batch_size'], shuffle=False, collate_fn=data_collator) #TODO
+    train_dataloader = DataLoader(train_dataset, batch_size=train_config['batch_size'], shuffle=True, collate_fn=data_collator)
     test_dataloader = DataLoader(test_dataset, batch_size=train_config['batch_size'], shuffle=False, collate_fn=data_collator)
 
 
@@ -412,6 +414,8 @@ if __name__ == "__main__":
         model.freeze_layers()
         train_fn = train_embeddings
     elif training_type == "fine-tune":
+        if freeze:
+            model.freeze_layers()
         train_fn = train_model
     
     train_fn(
