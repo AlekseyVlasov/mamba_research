@@ -213,22 +213,24 @@ def train_embeddings(seed, device, train_loader, val_loader, model, wandb_config
     learning_rate = train_config['learning_rate']
     tokens_num = model_config['tokens_num']
     period = model_config['period']
-    warmup_percent = train_config['warmup_percent']  # Now represents a percentage of total steps
+    warmup_percent = train_config['warmup_percent']
+    accumulation_steps = train_config.get('accumulation_steps', 1)  # Gradient accumulation steps
 
+    # Initialize the special token as trainable parameters
     special_token = torch.randn(1, tokens_num, model.config.d_model, requires_grad=True, device=device)
     model.to(device)
     
-    # Define the loss function and optimizer
     criterion = nn.CrossEntropyLoss()
-    # optimizer = optim.AdamW([special_token, model.parameters()], lr=learning_rate)
-
+    
+    # Define the optimizer
     optimizer = optim.AdamW(
         [{'params': [special_token], 'lr': learning_rate},
-        {'params': model.parameters(), 'lr': learning_rate}],
+         {'params': model.parameters(), 'lr': learning_rate}],
     )
 
-    total_steps = num_epochs * len(train_loader)
-    warmup_steps = int(warmup_percent * total_steps)  # Calculate warmup steps as a percentage of total steps
+    # Define learning rate scheduler and warmup
+    total_steps = num_epochs * len(train_loader) / accumulation_steps
+    warmup_steps = int(warmup_percent * total_steps)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=5e-6)
     warmup_scheduler = warmup.LinearWarmup(optimizer, warmup_steps)
 
@@ -240,66 +242,85 @@ def train_embeddings(seed, device, train_loader, val_loader, model, wandb_config
     fix_seed(seed)
 
     for epoch in range(num_epochs):
-        model.train()  # Set model to evaluation mode
-        train_loss = 0.0
+        model.train()
+        total_train_loss = 0.0
         correct_train = 0
         total_train = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training")
-        for batch in pbar:
+        optimizer.zero_grad()  # Clear gradients at the start of the epoch
+
+        # Track accumulated loss and accuracy over accumulation steps
+        accumulated_loss = 0.0
+        accumulated_correct = 0
+        accumulated_total = 0
+
+        for step, batch in enumerate(pbar):
             inputs, labels = batch['input_ids'], batch['labels']
-            # Move data to the specified device
             inputs, labels = inputs.to(device), labels.to(device)
 
             # Convert inputs to embeddings without tracking gradients
             with torch.no_grad():
                 embedded_inputs = model.backbone.embedding(inputs)
 
+            # Add special token embeddings
             embedded_with_special = add_special_token(embedded_inputs, special_token, period, tokens_num)
-            
-            # Zero the gradients
-            optimizer.zero_grad()
 
-            # Forward pass with embeddings as input, using is_embeds=True
+            # Forward pass
             outputs = model(embedded_with_special, is_embeds=True, num_last_tokens=1)
             logits = outputs.logits[:, 0, :]
             loss = criterion(logits, labels)
 
-            # Backward pass and optimization
-            loss.backward()
-            optimizer.step()
+            # Scale loss for gradient accumulation
+            loss = loss / accumulation_steps  
+            loss.backward()  # Accumulate gradients
 
-            # Apply warmup and scheduler updates
-            with warmup_scheduler.dampening():
-                scheduler.step()
-
-            # Accumulate training loss and accuracy
-            train_loss += loss.item()
+            # Update accumulated metrics
+            accumulated_loss += loss.item()
             _, predicted = logits.max(1)
-            total_train += labels.size(0)
-            correct_train += predicted.eq(labels).sum().item()
+            accumulated_total += labels.size(0)
+            accumulated_correct += predicted.eq(labels).sum().item()
 
-            # Calculate local train accuracy
-            train_accuracy_local = 100 * correct_train / total_train
+            # Update weights only at accumulation steps
+            if (step + 1) % accumulation_steps == 0 or (step + 1) == len(train_loader):
+                optimizer.step()
+                optimizer.zero_grad()
 
-            # Log training metrics for each step
-            wandb.log({
-                "train_loss_step": loss.item(),
-                "train_accuracy_step": predicted.eq(labels).sum().item() / labels.size(0),
-                "lr_step": optimizer.param_groups[0]['lr']
-            })
+                # Update learning rate scheduler
+                with warmup_scheduler.dampening():
+                    scheduler.step()
 
-            # Display the current loss for each training batch
-            pbar.set_postfix({"Train Loss (batch)": loss.item()})
+                # Accumulate total epoch loss
+                total_train_loss += accumulated_loss
+                total_train += accumulated_total
+                correct_train += accumulated_correct
 
-        # ---- Epoch-Based Logging ----
+                # Compute accuracy across all accumulation steps
+                accumulated_accuracy = accumulated_correct / accumulated_total
+
+                # Log metrics after processing `accumulation_steps`
+                wandb.log({
+                    "train_loss_step": accumulated_loss,
+                    "train_accuracy_step": accumulated_accuracy,
+                    "lr_step": optimizer.param_groups[0]['lr']
+                })
+
+                # Display batch loss in tqdm progress bar
+                pbar.set_postfix({"Train Loss (batch)": accumulated_loss})
+
+                # Reset accumulated values
+                accumulated_loss = 0.0
+                accumulated_correct = 0
+                accumulated_total = 0
+
+        # Epoch-based logging
         train_accuracy_epoch = 100 * correct_train / total_train
         wandb.log({
-            "train_loss_epoch": train_loss / len(train_loader),
+            "train_loss_epoch": total_train_loss / len(train_loader),
             "train_accuracy_epoch": train_accuracy_epoch
         })
 
-        # ---- Validation phase after each epoch ----
+        # Validation phase after each epoch
         val_batch_losses_local, val_accuracy = inference(
             model, val_loader, device, criterion=criterion, num_last_tokens=1, special_token=special_token, period=period
         )
@@ -400,7 +421,7 @@ if __name__ == "__main__":
     test_dataset = tokenized_datasets["test"]
 
     train_dataloader = DataLoader(train_dataset, batch_size=train_config['batch_size'], shuffle=True, collate_fn=data_collator)
-    test_dataloader = DataLoader(test_dataset, batch_size=train_config['batch_size'], shuffle=False, collate_fn=data_collator)
+    test_dataloader = DataLoader(test_dataset, batch_size=train_config['test_batch_size'], shuffle=False, collate_fn=data_collator)
 
 
     # extract model class [mamba | transformer | etc.]
