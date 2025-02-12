@@ -42,3 +42,4 @@ build/           # Build directory for compiled packages
 *.pt
 *.pth
 wandb/
+.env
