@@ -21,6 +21,10 @@ from torch.utils.data import DataLoader
 from utils import print_model_size, fix_seed
 from models.MambaWithEmbeddings import MambaLMHeadModelWithEmbeddings
 
+import types
+
+from peft import LoraConfig, get_peft_model
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -332,6 +336,95 @@ def train_embeddings(seed, device, train_loader, val_loader, model, wandb_config
             "val_accuracy_epoch": val_accuracy
         })
 
+def train_lora(seed, device, train_loader, val_loader, model, wandb_config, train_config, model_config, save_model=False):
+    num_epochs = train_config['epochs']
+    learning_rate = train_config['learning_rate']
+    warmup_percent = train_config['warmup_percent']
+    accumulation_steps = train_config.get('accumulation_steps', 1)
+    
+    model.to(device)
+    
+    for name, param in model.named_parameters():
+        if "lora" not in name and "classification_head" not in name:
+            param.requires_grad = False
+        else:
+            param.requires_grad = True
+    
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate)
+    
+    total_steps = num_epochs * len(train_loader) / accumulation_steps
+    warmup_steps = int(warmup_percent * total_steps)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=5e-6)
+    warmup_scheduler = warmup.LinearWarmup(optimizer, warmup_steps)
+    
+    fix_seed(seed)
+    
+    for epoch in range(num_epochs):
+        model.train()
+        total_train_loss = 0.0
+        correct_train = 0
+        total_train = 0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training")
+        optimizer.zero_grad()
+        accumulated_loss = 0.0
+        accumulated_correct = 0
+        accumulated_total = 0
+        
+        for step, batch in enumerate(pbar):
+            inputs, labels = batch['input_ids'], batch['labels']
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            outputs = model(inputs, num_last_tokens=1)
+            logits = outputs.logits[:, 0, :]
+            loss = criterion(logits, labels)
+            
+            loss = loss / accumulation_steps
+            loss.backward()
+            
+            accumulated_loss += loss.item()
+            _, predicted = logits.max(1)
+            accumulated_total += labels.size(0)
+            accumulated_correct += predicted.eq(labels).sum().item()
+            
+            if (step + 1) % accumulation_steps == 0 or (step + 1) == len(train_loader):
+                optimizer.step()
+                optimizer.zero_grad()
+                
+                with warmup_scheduler.dampening():
+                    scheduler.step()
+                
+                total_train_loss += accumulated_loss
+                total_train += accumulated_total
+                correct_train += accumulated_correct
+                
+                wandb.log({
+                    "train_loss_step": accumulated_loss,
+                    "train_accuracy_step": accumulated_correct / accumulated_total,
+                    "lr_step": optimizer.param_groups[0]['lr']
+                })
+                
+                pbar.set_postfix({"Train Loss (batch)": accumulated_loss})
+                
+                accumulated_loss = 0.0
+                accumulated_correct = 0
+                accumulated_total = 0
+        
+        train_accuracy_epoch = 100 * correct_train / total_train
+        wandb.log({
+            "train_loss_epoch": total_train_loss / len(train_loader),
+            "train_accuracy_epoch": train_accuracy_epoch
+        })
+        
+        val_batch_losses, val_accuracy = inference(model, val_loader, device, criterion=criterion, num_last_tokens=1)
+        val_loss = sum(val_batch_losses) / len(val_batch_losses)
+        
+        wandb.log({
+            "val_loss_epoch": val_loss,
+            "val_accuracy_epoch": val_accuracy
+        })
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -388,6 +481,9 @@ if __name__ == "__main__":
     training_type = args["training_type"]
     if training_type == "fine-tune":
         freeze = args["freeze"]
+    
+    if "lora" in model_config:
+        lora_config = model_config["lora"]
 
     # start wandb logging
     if wandb_config is not None:
@@ -438,6 +534,22 @@ if __name__ == "__main__":
         if freeze:
             model.freeze_layers()
         train_fn = train_model
+    elif training_type == "lora":
+        config = LoraConfig(
+            r=lora_config["r"],
+            lora_alpha=lora_config["lora_alpha"],
+            bias=lora_config["bias"],
+            target_modules=lora_config["target_modules"],
+            lora_dropout=lora_config["lora_dropout"],
+        )
+
+        # Hot-fix for get_peft_model to work
+        def get_method(self, key, default=None):
+            return getattr(self, key, default)
+
+        model.config.get = types.MethodType(get_method, model.config)
+        model = get_peft_model(model, config)
+        train_fn = train_lora
     
     train_fn(
         seed,

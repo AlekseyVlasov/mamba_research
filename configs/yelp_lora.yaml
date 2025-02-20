@@ -1,0 +1,27 @@
+gpu_number: 1
+seed: 1234
+save_model: False
+
+wandb:
+  project: "mamba-research"
+  group: "yelp_reviews"
+  name: "lora"
+
+model:
+  name: "state-spaces/mamba-130m"
+  lora:
+    r: 8
+    lora_alpha: 16
+    lora_dropout: 0.1
+    bias: "none"
+    target_modules: ["in_proj", "x_proj", "dt_proj", "out_proj"]
+
+training_type: "lora"
+
+training:
+  test_batch_size: 16
+  batch_size: 16
+  accumulation_steps: 1
+  epochs: 3
+  learning_rate: 0.001
+  warmup_percent: 0.05
