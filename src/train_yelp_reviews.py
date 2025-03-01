@@ -18,7 +18,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, DataCollatorWithPadding
 from torch.utils.data import DataLoader
 
-from utils import print_model_size, fix_seed
+from utils import print_model_size, fix_seed, print_trainable_params_num
 from models.MambaWithEmbeddings import MambaLMHeadModelWithEmbeddings
 
 import types
@@ -33,7 +33,17 @@ load_dotenv()
 def add_special_token(embedded_inputs, special_token, period, tokens_num):
     # Expand special_token to match batch size
     batch_special_token = special_token.expand(embedded_inputs.size(0), -1, -1)
-
+    
+    # Special case: add token only at the beginning when period is -1
+    if period == -1:
+        embedded_with_special = torch.cat((batch_special_token, embedded_inputs), dim=1)
+        
+        # Ensure sequence length matches the original plus the added special tokens
+        assert embedded_with_special.size()[1] == embedded_inputs.size(1) + tokens_num
+        
+        return embedded_with_special
+    
+    # Regular case: Insert special token after every period tokens
     # Calculate number of period-token chunks
     num_chunks = embedded_inputs.shape[1] // period + (1 if embedded_inputs.shape[1] % period != 0 else 0)
 
@@ -48,9 +58,7 @@ def add_special_token(embedded_inputs, special_token, period, tokens_num):
 
     # Ensure sequence length matches the original plus the added special tokens
     assert embedded_with_special.size()[1] == embedded_inputs.size(1) + tokens_num * num_chunks
-#     embedded_with_special = embedded_with_special[:, :embedded_inputs.size(1) + num_chunks]
-
-
+    
     return embedded_with_special
 
 def inference(model, data, device, criterion=None, num_last_tokens=1, special_token=None, period=None):
@@ -352,6 +360,7 @@ def train_lora(seed, device, train_loader, val_loader, model, wandb_config, trai
     
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate)
+    print_trainable_params_num(model)
     
     total_steps = num_epochs * len(train_loader) / accumulation_steps
     warmup_steps = int(warmup_percent * total_steps)

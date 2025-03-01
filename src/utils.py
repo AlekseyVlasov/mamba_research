@@ -16,3 +16,7 @@ def print_model_size(model):
 def fix_seed(seed):
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+def print_trainable_params_num(model):
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model trainable parameters number: {trainable_params:,}")

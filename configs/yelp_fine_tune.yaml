@@ -5,12 +5,13 @@ save_model: False
 wandb:
   project: "mamba-research"
   group: "yelp_reviews"
-  name: "fine-tune"
+  name: "fine-tune only classification head"
 
 model:
   name: "state-spaces/mamba-130m"
 
 training_type: "fine-tune"
+freeze: True
 
 training:
   batch_size: 16

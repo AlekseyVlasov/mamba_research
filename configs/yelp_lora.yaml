@@ -10,11 +10,13 @@ wandb:
 model:
   name: "state-spaces/mamba-130m"
   lora:
-    r: 8
-    lora_alpha: 16
+    r: 1
+    lora_alpha: 2
     lora_dropout: 0.1
     bias: "none"
-    target_modules: ["in_proj", "x_proj", "dt_proj", "out_proj"]
+    # target_modules: ["in_proj", "x_proj", "dt_proj", "out_proj"]
+    # target_modules: ["in_proj", "out_proj"]
+    target_modules: ["out_proj"]
 
 training_type: "lora"
 
@@ -23,5 +25,5 @@ training:
   batch_size: 16
   accumulation_steps: 1
   epochs: 3
-  learning_rate: 0.001
+  learning_rate: 0.0001
   warmup_percent: 0.05
