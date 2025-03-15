@@ -1,27 +1,26 @@
 import argparse
 import torch
+import pytorch_warmup as warmup
 import wandb
+from tqdm import tqdm
 import yaml
 import sys
 import os
 
+import torch
+import torch.optim as optim
+import torch.nn as nn
+import numpy as np
+
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+
 from mamba_ssm.models.config_mamba import MambaConfig
 
-from datasets import load_dataset
-from transformers import AutoTokenizer, DataCollatorWithPadding
-from torch.utils.data import DataLoader
-
-from utils import print_model_size, fix_seed, print_trainable_params_num
+from utils import fix_seed, print_model_size
 from models.MambaWithEmbeddings import MambaLMHeadModelWithEmbeddings
 from training_functions import train_model, train_embeddings, train_lora
-
-import types
-
-from peft import LoraConfig, get_peft_model
-
-from dotenv import load_dotenv
-
-load_dotenv()
+from data.InductionHeads import ICLDataModule
 
 
 if __name__ == "__main__":
@@ -36,7 +35,6 @@ if __name__ == "__main__":
     period = parser.parse_args().period
 
     print("\nUsing config {0}".format(config))
-
 
     # get args
     with open("configs/"+config) as stream:
@@ -76,12 +74,8 @@ if __name__ == "__main__":
     # split configs
     model_config = args["model"]
     train_config = args["training"]
+    data_config = args["dataset"]
     training_type = args["training_type"]
-    if training_type == "fine-tune":
-        freeze = args["freeze"]
-    
-    if "lora" in model_config:
-        lora_config = model_config["lora"]
 
     # start wandb logging
     if wandb_config is not None:
@@ -97,57 +91,78 @@ if __name__ == "__main__":
                 settings=wandb.Settings(_disable_stats=True)
         )
     
-    dataset = load_dataset("yelp_polarity")
-    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+    # prepare dataset
+    module = ICLDataModule(
+        num_examples=data_config['train_examples'],
+        num_test_examples=data_config['test_examples'],
+        vocab_size=data_config['vocab_size'],
+        input_seq_len=data_config['input_seq_len'],
+        copy_method='induction_head',
+        # Default parameters
+        number_duplicates_per_epoch=0,
+        seed=args['seed'],
+        split_train_test=False,
+        induction_len=1,
+        induction_num_triggers=1,
+        allow_dot=False,
+        max_copy_len=10,
+        test_seq_len=None,
+        num_keys=1,
+        data_dir='data',
+        vary_length=data_config['vary_length']
+    )
 
-    if tokenizer.pad_token is None:
-        # tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
+    module.setup()
 
-    def tokenize_function(examples):
-        return tokenizer(examples["text"], padding=True, truncation=True, max_length=512)
-
-    tokenized_datasets = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
-
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="pt")
-
-    train_dataset = tokenized_datasets["train"]
-    test_dataset = tokenized_datasets["test"]
-
-    train_dataloader = DataLoader(train_dataset, batch_size=train_config['batch_size'], shuffle=True, collate_fn=data_collator)
-    test_dataloader = DataLoader(test_dataset, batch_size=train_config['test_batch_size'], shuffle=False, collate_fn=data_collator)
-
-
-    # extract model class [mamba | transformer | etc.]
-    model_name = model_config.pop("name")
-    
-    fix_seed(seed)
-    model = MambaLMHeadModelWithEmbeddings.from_pretrained(model_name, num_labels=2)
+    # dataloaders
+    train_dataloader = module.train_dataloader(batch_size=train_config['batch_size'])
+    test_dataloader = module.val_dataloader(batch_size=data_config['test_batch_size'])
 
     train_fn = None
-    if training_type == "embeddings":
-        model.freeze_layers()
-        train_fn = train_embeddings
-    elif training_type == "fine-tune":
-        if freeze:
-            model.freeze_layers()
-        train_fn = train_model
-    elif training_type == "lora":
-        config = LoraConfig(
-            r=lora_config["r"],
-            lora_alpha=lora_config["lora_alpha"],
-            bias=lora_config["bias"],
-            target_modules=lora_config["target_modules"],
-            lora_dropout=lora_config["lora_dropout"],
+    model = None
+    if training_type == "mamba":
+        model_cls = MambaLMHeadModelWithEmbeddings
+
+        ssm_cfg = {
+            'layer': 'Mamba1',
+            'd_state': model_config['d_state'],
+        #     'd_conv': 4,
+        #     'expand': 2,
+        #     'dt_rank': "auto",
+        #     'dt_min': 0.001,
+        #     'dt_max': 0.1,
+        #     'dt_init': "random",
+        #     'dt_scale': 1.0,
+        #     'dt_init_floor': 1e-4,
+        #     'conv_bias': True,
+        #     'bias': False,
+            'use_fast_path': True
+        }
+
+        config = MambaConfig(
+            d_model = model_config['d_model'],
+        #     d_intermediate = 0,
+            n_layer = model_config['n_layer'],
+            vocab_size = data_config['vocab_size'],
+            ssm_cfg=ssm_cfg,
+        #     attn_layer_idx = field(default_factory=list),
+        #     attn_cfg = field(default_factory=dict),
+        #     rms_norm = True,
+        #     residual_in_fp32 = True,
+        #     fused_add_norm = True,
+        #     pad_vocab_size_multiple = 8,
+        #     tie_embeddings = True,
         )
 
-        # Hot-fix for get_peft_model to work
-        def get_method(self, key, default=None):
-            return getattr(self, key, default)
-
-        model.config.get = types.MethodType(get_method, model.config)
-        model = get_peft_model(model, config)
-        train_fn = train_lora
+        fix_seed(seed)
+        model = model_cls(config)
+        train_fn = train_model
+    elif training_type == "embeddings":
+        model = torch.load(f'models/{model_config['base_model']}.pth')
+        model.freeze_layers()
+        train_fn = train_embeddings
+    else:
+        raise RuntimeError("{0} is not a valid model option".format(training_type))
     
     train_fn(
         seed,
