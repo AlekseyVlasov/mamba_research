@@ -263,6 +263,8 @@ class MambaLMHeadModelWithEmbeddings(nn.Module, GenerationMixin):
 
         if self.num_labels is not None:
             self.classification_head = nn.Linear(d_model, num_labels, **factory_kwargs)
+        else:
+            self.classification_head = None
 
         # Initialize weights and apply final processing
         self.apply(
