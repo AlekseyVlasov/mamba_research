@@ -297,6 +297,7 @@ class ICLDataModule(SequenceDataset):
         test_seq_len: int = None,
         num_keys: int = 1, # number of keys for associative recall,
         data_dir: str = None,
+        vary_length: bool = False,
         *args, **kwargs
     ):
         self.num_examples = num_examples
@@ -307,12 +308,14 @@ class ICLDataModule(SequenceDataset):
         assert copy_method in ["induction_head", "assoc_recall"]
         self.number_duplicates_per_epoch = number_duplicates_per_epoch
         self.seed = seed
+        self.rng = np.random.default_rng(self.seed)
         self.split_train_test = split_train_test # let the same copy chars appear in train/test
         self.induction_len = induction_len
         self.induction_num_triggers = induction_num_triggers
         self.allow_dot = allow_dot
         self.max_copy_len = max_copy_len
         self.data_dir = data_dir
+        self.vary_length = vary_length
         
         if test_seq_len is not None:
             self.test_seq_len = test_seq_len
@@ -374,7 +377,6 @@ class ICLDataModule(SequenceDataset):
         if train_tensor is None or test_tensor is None:     
             if hasattr(self, 'dataset'):
                 return
-            self.rng = np.random.default_rng(self.seed)
 
             if self.split_train_test:
                 all_vocab = self.vocab.non_special_vocab
@@ -436,13 +438,22 @@ class ICLDataModule(SequenceDataset):
         }
 
     def train_dataloader(self, batch_size=None, *args, **kwargs):
-        return self._data_loader(self.dataset['train'], shuffle=True, batch_size=batch_size)
+        if self.vary_length:
+            return self._variable_length_data_loader(self.dataset['train'], shuffle=True, batch_size=batch_size)
+        else:
+            return self._data_loader(self.dataset['train'], shuffle=True, batch_size=batch_size)
 
     def val_dataloader(self, batch_size=None, *args, **kwargs):
-        return self._data_loader(self.dataset['test'], shuffle=False, batch_size=batch_size)
+        if self.vary_length:
+            return self._variable_length_data_loader(self.dataset['test'], shuffle=False, batch_size=batch_size)
+        else:
+            return self._data_loader(self.dataset['test'], shuffle=False, batch_size=batch_size)
 
     def test_dataloader(self, batch_size=None, *args, **kwargs):
-        return self._data_loader(self.dataset['test'], shuffle=False, batch_size=batch_size)
+        if self.vary_length:
+            return self._variable_length_data_loader(self.dataset['test'], shuffle=False, batch_size=batch_size)
+        else:
+            return self._data_loader(self.dataset['test'], shuffle=False, batch_size=batch_size)
 
     def _data_loader(self, dataset: Dataset, shuffle: bool = False, batch_size=None) -> DataLoader:
         return DataLoader(
@@ -452,3 +463,32 @@ class ICLDataModule(SequenceDataset):
             shuffle=shuffle,
 #             persistent_workers=True
         )
+
+
+    def _variable_length_data_loader(self, dataset: Dataset, shuffle: bool = False, batch_size=None) -> DataLoader:
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            collate_fn=self._custom_collate
+        )
+
+    def _custom_collate(self, batch):
+        inputs, labels = zip(*batch)
+        inputs = torch.stack(inputs)
+        labels = torch.tensor(labels)
+        
+        seq_len = self.rng.integers(1, self.input_seq_len + 1)
+        inputs = inputs[:, -seq_len:]
+        
+        filtered_inputs = []
+        filtered_labels = []
+        for inp, lbl in zip(inputs, labels):
+            if (inp == 15).sum().item() == 2:
+                filtered_inputs.append(inp)
+                filtered_labels.append(lbl)
+        
+        if not filtered_inputs:
+            return [None, None]
+        
+        return [torch.stack(filtered_inputs), torch.tensor(filtered_labels)]
