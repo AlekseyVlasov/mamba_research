@@ -43,3 +43,4 @@ build/           # Build directory for compiled packages
 *.pth
 wandb/
 .env
+.ipynb_checkpoints
