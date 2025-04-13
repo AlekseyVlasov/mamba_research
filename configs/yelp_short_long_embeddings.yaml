@@ -1,0 +1,25 @@
+gpu_number: 1
+seed: 1234
+save_model: False
+
+wandb:
+  project: "mamba-research"
+  group: "yelp_reviews"
+  name: "embeddings, period=-1, tokens=50, short=128, long=512"
+
+model:
+  name: "state-spaces/mamba-130m"
+  period: -1
+  tokens_num: 50
+
+training_type: "embeddings"
+
+training:
+  short: 128
+  long: 512
+  test_batch_size: 1
+  batch_size: 16
+  accumulation_steps: 1
+  epochs: 3
+  learning_rate: 0.001
+  warmup_percent: 0.05
