@@ -1,6 +1,6 @@
 # 🧠 Fine-Tuning Mamba with Learnable Inputs (Diploma Research)
 
-This repository contains the code and experiments for a diploma project focused on **parameter-efficient fine-tuning** of the [Mamba](https://arxiv.org/abs/2301.10946) model using **learnable input tokens**. The core idea is to adapt the **prefix-tuning** method to better align with the **recurrent nature** of Mamba, resulting in a new approach: **periodic-tuning**.
+This repository contains the code and experiments for a diploma project focused on **parameter-efficient fine-tuning** of the [Mamba](https://arxiv.org/abs/2312.00752) model using **learnable input tokens**. The core idea is to adapt the **prefix-tuning** method to better align with the **recurrent nature** of Mamba, resulting in a new approach: **periodic-tuning**.
 
 ---
 
