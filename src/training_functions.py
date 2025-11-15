@@ -213,6 +213,7 @@ def unpack_batch(batch):
     
 
 def train_embeddings(seed, device, train_loader, val_loader, model, wandb_config, train_config, model_config, save_model=False):
+    fix_seed(seed)
     num_epochs = train_config['epochs']
     learning_rate = train_config['learning_rate']
     tokens_num = model_config['tokens_num']
