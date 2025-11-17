@@ -5,11 +5,13 @@ from typing import Dict
 import numpy as np
 from tqdm import tqdm
 from collections import Counter
+from pathlib import Path
+from functools import partial
 
 class Vocab:
     """Custom vocab."""
     def __init__(self, vocab_size: int, special_vocabs: Dict):
-        # Special tokens hold copy_prefix and noop/pad token etc
+        # Special tokens hold copy_prefix, paste_prefix and noop/pad token etc
         assert "copy_prefix" in special_vocabs
         self.special_vocabs = special_vocabs
         vocab = [str(v) for v in list(range(vocab_size))]
@@ -28,6 +30,10 @@ class Vocab:
     @property
     def copy_prefix(self):
         return self.special_vocabs["copy_prefix"]
+
+    @property
+    def paste_prefix(self):
+        return self.special_vocabs["paste_prefix"]
 
     @property
     def noop(self):
@@ -53,14 +59,21 @@ class Tokenizer:
         self.vocab = vocab
 
     def tokenize(self, text: str, return_tensor=False, mask_input=False):
-        input_ids = [self.vocab.get_id(t) for t in text.split()]
-        if self.vocab.get_id(self.vocab.copy_prefix) not in input_ids:
-            raise ValueError("Input text must contain copy_prefix token.")
-        copy_prefix_pos = input_ids.index(self.vocab.get_id(self.vocab.copy_prefix))
+        input_tokens = text.split()
+        input_ids = [self.vocab.get_id(token) for token in input_tokens]
         labels = input_ids
         if mask_input:
-            # Mask the input tokens for loss but do not mask the copied token
-            labels = [-100] * (copy_prefix_pos+1) + labels[copy_prefix_pos+1:]
+            # Prefer masking up to and including the paste token if present; otherwise, up to copy token
+            paste_token = self.vocab.paste_prefix
+            copy_token = self.vocab.copy_prefix
+            paste_id = self.vocab.get_id(paste_token)
+            copy_id = self.vocab.get_id(copy_token)
+            if paste_id in input_ids:
+                paste_pos = input_ids.index(paste_id)
+                labels = [-100] * (paste_pos + 1) + labels[paste_pos + 1:]
+            elif copy_id in input_ids:
+                copy_pos = input_ids.index(copy_id)
+                labels = [-100] * (copy_pos + 1) + labels[copy_pos + 1:]
         if return_tensor:
             input_ids = torch.LongTensor(input_ids)
             labels = torch.LongTensor(labels)
@@ -73,14 +86,17 @@ class Tokenizer:
         return " ".join([self.vocab.get_vocab(id) for id in ids])
 
 def generate_start_seq(vocab: Vocab, input_seq_len: int, rng: np.random.Generator):
-    """Generate token sequence up to and including the copy_prefix token."""
+    """Generate token sequence up to and including the paste_prefix token."""
     vocab_seq = rng.choice(
         vocab.vocab,
         input_seq_len,
         replace=True,
         # Do not generate any special tokens
         p=[1/(len(vocab)-len(vocab.special_tokens)) if p not in vocab.special_tokens else 0 for p in vocab.vocab])
-    vocab_seq = np.append(vocab_seq, vocab.copy_prefix)
+    # Append the paste token to mark where the model should output the copied token
+    if vocab.paste_prefix is None:
+        raise ValueError("paste_prefix must be defined in special_vocabs for induction heads.")
+    vocab_seq = np.append(vocab_seq, vocab.paste_prefix)
     return vocab_seq.tolist()
 
 def generate_induction_head(
@@ -97,6 +113,7 @@ def generate_induction_head(
     """
     if valid_chars is not None:
         raise NotImplementedError("Valid chars not implemented for induction heads.")
+    # Start sequence ends with a paste token; copy triggers will be placed earlier
     vocab_seq = generate_start_seq(vocab, input_seq_len, rng)
     if rng.uniform() < 0.5:
         num_triggers = 1
@@ -120,6 +137,7 @@ def generate_induction_head(
     # if valid_chars is not None and to_copy not in valid_chars:
     #     vocab_seq[pos+1] = rng.choice(valid_chars)
     #     to_copy = vocab_seq[pos+1]
+    # Final sequence ends with the paste token (already appended) followed by the copied token(s)
     vocab_seq = vocab_seq + to_copy
     return " ".join(vocab_seq)
 
@@ -325,6 +343,7 @@ class ICLDataModule(SequenceDataset):
 
         special_vocabs = {
             "copy_prefix": "=>",
+            "paste_prefix": "<=",
             "noop": "."
         }
         self.special_vocabs = special_vocabs
@@ -470,25 +489,92 @@ class ICLDataModule(SequenceDataset):
             dataset,
             batch_size=batch_size,
             shuffle=shuffle,
-            collate_fn=self._custom_collate
+            collate_fn=partial(self._custom_collate, dataset=dataset, target_batch_size=batch_size)
         )
 
-    def _custom_collate(self, batch):
+    def _custom_collate(self, batch, dataset=None, target_batch_size=None):
         inputs, labels = zip(*batch)
         inputs = torch.stack(inputs)
         labels = torch.tensor(labels)
         
-        seq_len = self.rng.integers(1, self.input_seq_len + 1)
-        inputs = inputs[:, -seq_len:]
-        
-        filtered_inputs = []
-        filtered_labels = []
-        for inp, lbl in zip(inputs, labels):
-            if (inp == 15).sum().item() == 2:
-                filtered_inputs.append(inp)
-                filtered_labels.append(lbl)
-        
-        if not filtered_inputs:
-            return [None, None]
-        
-        return [torch.stack(filtered_inputs), torch.tensor(filtered_labels)]
+        # Determine target batch size
+        if target_batch_size is None:
+            target_batch_size = inputs.size(0)
+
+        # Choose a random crop length; clamp to theoretical minimum for including copy & paste
+        random_seq_len = int(self.rng.integers(1, self.input_seq_len + 1))
+
+        copy_id = self.vocab.get_id(self.vocab.copy_prefix)
+        paste_id = self.vocab.get_id(self.vocab.paste_prefix)
+
+        total_len = inputs.size(1)
+        min_window_len = 2 + getattr(self, 'induction_len', 1)  # at least copy & paste
+
+        # Compute per-sample minimal crop length (from right) to include the last copy token
+        required_lengths = []
+        for inp in inputs:
+            copy_positions = (inp == copy_id).nonzero(as_tuple=False).view(-1)
+            if copy_positions.numel() == 0:
+                required_lengths.append(total_len + 1)
+            else:
+                last_copy_pos = int(copy_positions.max().item())
+                required_lengths.append(total_len - last_copy_pos)
+
+        min_required = min(required_lengths) if len(required_lengths) > 0 else 1
+        seq_len = max(random_seq_len, min_window_len)
+        if all(req > seq_len for req in required_lengths):
+            seq_len = max(min_required, min_window_len)
+        seq_len = min(seq_len, total_len)
+
+        def filter_batch(inp_batch, lbl_batch):
+            cropped_local = inp_batch[:, -seq_len:]
+            has_copy_local = (cropped_local == copy_id).any(dim=1)
+            has_paste_local = (cropped_local == paste_id).any(dim=1)
+            keep_local = has_copy_local & has_paste_local
+            return cropped_local[keep_local], lbl_batch[keep_local]
+
+        filtered_inputs, filtered_labels = filter_batch(inputs, labels)
+
+        # Refill to target batch size by drawing extra samples from the dataset if available
+        if dataset is not None and filtered_inputs.size(0) < target_batch_size:
+            max_extra_draws = max(target_batch_size * 5, 32)
+            draws = 0
+            while filtered_inputs.size(0) < target_batch_size and draws < max_extra_draws:
+                need = target_batch_size - filtered_inputs.size(0)
+                idxs = self.rng.integers(0, len(dataset), size=int(need)).tolist()
+                extra_samples = [dataset[i] for i in idxs]
+                if len(extra_samples) == 0:
+                    break
+                extra_inp, extra_lbl = zip(*extra_samples)
+                extra_inp = torch.stack(list(extra_inp))
+                extra_lbl = torch.tensor(list(extra_lbl))
+                extra_inputs_f, extra_labels_f = filter_batch(extra_inp, extra_lbl)
+                if extra_inputs_f.size(0) > 0:
+                    filtered_inputs = torch.cat([filtered_inputs, extra_inputs_f], dim=0) if filtered_inputs.numel() > 0 else extra_inputs_f
+                    filtered_labels = torch.cat([filtered_labels, extra_labels_f], dim=0) if filtered_labels.numel() > 0 else extra_labels_f
+                draws += need
+
+        # If still not enough, repeat samples with replacement to reach target size
+        if filtered_inputs.size(0) == 0:
+            # As a last resort, fall back to full-length right crop to try to get at least some
+            seq_len_full = total_len
+            cropped_full = inputs[:, -seq_len_full:]
+            has_copy_full = (cropped_full == copy_id).any(dim=1)
+            has_paste_full = (cropped_full == paste_id).any(dim=1)
+            keep_full = has_copy_full & has_paste_full
+            if keep_full.any().item():
+                filtered_inputs = cropped_full[keep_full]
+                filtered_labels = labels[keep_full]
+
+        if filtered_inputs.size(0) > 0 and filtered_inputs.size(0) < target_batch_size:
+            # Repeat with replacement
+            repeat_indices = torch.randint(low=0, high=filtered_inputs.size(0), size=(target_batch_size - filtered_inputs.size(0),))
+            filtered_inputs = torch.cat([filtered_inputs, filtered_inputs[repeat_indices]], dim=0)
+            filtered_labels = torch.cat([filtered_labels, filtered_labels[repeat_indices]], dim=0)
+
+        # Trim excess if we overshot
+        if filtered_inputs.size(0) > target_batch_size:
+            filtered_inputs = filtered_inputs[:target_batch_size]
+            filtered_labels = filtered_labels[:target_batch_size]
+
+        return [filtered_inputs, filtered_labels]
