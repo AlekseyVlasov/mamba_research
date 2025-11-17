@@ -9,7 +9,7 @@ import torch.nn as nn
 from utils import print_model_size, fix_seed, print_trainable_params_num
 
 
-def add_special_token(embedded_inputs, special_token, period, tokens_num):
+def add_special_token(embedded_inputs, special_token, period, tokens_num, close_to_end=True):
     # Expand special_token to match batch size
     batch_special_token = special_token.expand(embedded_inputs.size(0), -1, -1)
     
@@ -25,22 +25,35 @@ def add_special_token(embedded_inputs, special_token, period, tokens_num):
     # Regular case: Insert special token after every period tokens
     # Calculate number of period-token chunks
     num_chunks = embedded_inputs.shape[1] // period + (1 if embedded_inputs.shape[1] % period != 0 else 0)
+    if not close_to_end:
+        num_chunks = num_chunks - 1
 
-    # Insert special token after every period tokens
-    embedded_with_special = torch.cat(
-        [
-            torch.cat((batch_special_token, embedded_inputs[:, i * period : (i + 1) * period]), dim=1)
-            for i in range(num_chunks)
-        ],
-        dim=1
-    )
+    # Build the result by inserting special tokens exactly num_chunks times
+    result_chunks = []
+    
+    for i in range(num_chunks):
+        # Add special token first
+        result_chunks.append(batch_special_token)
+        
+        # Add the corresponding period of tokens
+        start_idx = i * period
+        end_idx = min((i + 1) * period, embedded_inputs.shape[1])
+        result_chunks.append(embedded_inputs[:, start_idx:end_idx])
+    
+    # Add any remaining tokens after the last complete chunk
+    remaining_start = num_chunks * period
+    if remaining_start < embedded_inputs.shape[1]:
+        result_chunks.append(embedded_inputs[:, remaining_start:])
+    
+    # Concatenate all chunks
+    embedded_with_special = torch.cat(result_chunks, dim=1)
 
     # Ensure sequence length matches the original plus the added special tokens
     assert embedded_with_special.size()[1] == embedded_inputs.size(1) + tokens_num * num_chunks
     
     return embedded_with_special
 
-def inference(model, data, device, criterion=None, num_last_tokens=1, special_token=None, period=None, log=True):
+def inference(model, data, device, criterion=None, num_last_tokens=1, special_token=None, period=None, log=True, return_probs=False, close_to_end=True):
     """
     Performs inference with the model. Can handle a single batch or an entire DataLoader.
     
@@ -51,16 +64,21 @@ def inference(model, data, device, criterion=None, num_last_tokens=1, special_to
     - criterion: torch.nn.Module (optional) - loss function for calculating loss.
     - num_last_tokens: int - number of last tokens to predict (default is 1).
     - special_token: torch.Tensor (optional) - special token to insert after every 1000 tokens.
+    - return_probs: bool (optional) - if True, also return per-token probabilities for the
+      predicted positions. Shape will be [N, num_last_tokens, vocab_size] where N is the
+      total number of evaluated samples across the DataLoader.
 
     Returns:
-    - list of batch losses and accuracy if DataLoader passed.
-    - torch.Tensor if single batch passed - predicted classes.
+    - If return_probs is False (default): (batch_losses: List[float], accuracy: float)
+    - If return_probs is True: (batch_losses: List[float], accuracy: float,
+      token_probs: torch.FloatTensor [N, num_last_tokens, vocab_size])
     """
     model.eval()  # Set model to evaluation mode
     
     batch_losses = []
     correct = 0
     total = 0
+    all_token_probs = [] if return_probs else None
 
     with torch.no_grad():
         pbar = tqdm(data, desc="Inference")
@@ -75,7 +93,7 @@ def inference(model, data, device, criterion=None, num_last_tokens=1, special_to
                 # Convert inputs to embeddings
                 embedded_inputs = model.backbone.embedding(inputs)
 
-                embedded_with_special = add_special_token(embedded_inputs, special_token, period, tokens_num)
+                embedded_with_special = add_special_token(embedded_inputs, special_token, period, tokens_num, close_to_end=close_to_end)
                 
                 # Forward pass with embeddings as input, using is_embeds=True
                 outputs = model(embedded_with_special, is_embeds=True, num_last_tokens=num_last_tokens)
@@ -98,6 +116,11 @@ def inference(model, data, device, criterion=None, num_last_tokens=1, special_to
             # Calculate step accuracy
             step_accuracy = 100 * predicted.eq(labels).sum().item() / labels.size(0)
 
+            # Collect per-token probabilities if requested
+            if return_probs:
+                probs_batch = torch.softmax(outputs.logits, dim=-1)
+                all_token_probs.append(probs_batch.detach().cpu())
+
             # Log metrics for each step
             if log:
                 wandb.log({
@@ -107,6 +130,9 @@ def inference(model, data, device, criterion=None, num_last_tokens=1, special_to
 
     # Calculate overall accuracy
     accuracy = 100 * correct / total
+    if return_probs:
+        token_probs = torch.cat(all_token_probs, dim=0) if len(all_token_probs) > 0 else torch.empty(0)
+        return batch_losses, accuracy, token_probs
     return batch_losses, accuracy
 
 def train_model(seed, device, train_loader, val_loader, model, wandb_config, train_config, model_config, save_model=False):
